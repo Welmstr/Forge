@@ -24,3 +24,4 @@ examples/*/gate.json
 .idea/
 *.swp
 .DS_Store
+examples/*/gate.json
