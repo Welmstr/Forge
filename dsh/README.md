@@ -40,6 +40,7 @@ kopt-dsh/
 | `kopt_pending` | — | 还欠着没写的散文 |
 | `kopt_propose` | S6 | 申请开始下一轮；有欠账就拒 |
 | `kopt_guard` | — | 路径写权限裁决 |
+| `kopt_inspect` | — | **只读**反汇编一个产物，看编译器生成了什么 |
 | （无） | S9 | **没有 `kopt_bench` 工具** |
 
 最后一行是这份插件里最重要的设计决定。Python 侧的 `bench` 子命令还在（人是可以用的），
@@ -53,6 +54,27 @@ kopt-dsh/
 入口名叫 `gate-approve` / `gate-amend` / `gate-reject`。
 `ctx.approval` 按设计 §9b.3 只适合给「一次不可逆动作」做授权，不适合存闸门状态；
 而把 `gate-approve` 暴露成工具，等于给 agent 一个「自己点通过」的按钮。
+
+### `kopt_inspect`：眼睛，不是手
+
+编译参数是**优化手段**（agent 可以选），产物汇编码是**验证材料**（agent 只能看）。
+这个工具给的是后者：
+
+- 不编译、不运行、不计时，只对一个已存在的 `.so/.o/.a/.elf` 做反汇编；
+- 给目标文件以外的东西（比如 `.py`）直接 `exit 8`，**绝不返回空**——
+  空的"汇编"看起来就像"编译器什么都没生成"；
+- 参数由 CLI 拼死，agent 传不进来任何东西；
+- **调不调用由 agent 自己决定**，它不是流程里的某一步。
+
+### 日志：程序写，agent 改不了
+
+每次工具调用返回之后，适配器自己调一次 `kopt log-event`，往
+`Forge-Logs` 里追加一行 `calls.jsonl`。agent 没有写日志的工具。
+
+理由很直接：你要用日志检查 agent 是否符合预期。日志要是 agent 自己写的，
+它写的正是你要检查的东西。
+
+配置项 `logRoot` 指向 `Forge-Logs` 的 checkout；为空则日志关闭，并在启动时 warn。
 
 ---
 
