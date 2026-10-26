@@ -1,0 +1,23 @@
+{
+  "name": "@local/kopt-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Operator-kernel optimization harness: the program steers, evidence decides.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

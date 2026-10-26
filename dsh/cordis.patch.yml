@@ -1,0 +1,3 @@
+- insert:
+    - id: kopt-harness
+      name: '@local/kopt-harness'

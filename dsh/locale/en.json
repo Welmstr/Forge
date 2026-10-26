@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "kopt Optimization Harness",
+    "description": "Kernel-optimization harness where the program steers and evidence decides: probing, precision gates, paired timing, verdicts, and prose the agent owes after every result."
+  }
+}

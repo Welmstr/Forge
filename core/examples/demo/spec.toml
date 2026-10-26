@@ -1,0 +1,37 @@
+[problem]
+name = "vecadd-scaled-add"
+reference = "reference/reference.py"
+entry = "run"
+
+[target]
+# 本示例把参考实现放慢过（见 reference/README.md），
+# 所以目标定在 2.0x。真实题目里这个数来自你对「值得做」的判定。
+min_speedup = 2.0
+
+# ---- 精度阈值：唯一来源 ----
+[tolerance.fp32]
+metric = "rel_l2"
+threshold = 1e-6
+
+[tolerance.fp64]
+metric = "rel_l2"
+threshold = 1e-12
+
+[[case]]
+shape = [512, 512]
+dtype = "fp32"
+
+[[case]]
+shape = [1024, 256]
+dtype = "fp32"
+
+[verify]
+seeds = [0, 1]
+fresh_inputs = true
+
+[bench]
+warmup = 3
+min_pairs = 5
+bootstrap_resamples = 2000
+bootstrap_seed = 17
+suspect_speedup = 10.0

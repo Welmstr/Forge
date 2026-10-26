@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# 布局说明（写给下次想把 kopt/ 挪进 src/ 的人）：
+#
+#   仓库根
+#     pyproject.toml
+#     kopt/              ← Python 包，与仓库根的 basename 同名，纯属巧合
+#     examples/          ← 示例项目。示例项目根是 examples/demo，**不是**仓库根
+#
+# 两者同名会带来一个真实的坑：在仓库根里 `python -m kopt.cli` 时，仓库根在
+# sys.path[0] 上，而 editable 安装的 finder 对顶层包一律按**命名空间包**处理
+# （MAPPING 只给目录、不认 __init__.py），于是 `import kopt` 命中的是一个没有
+# `__init__.py` 的空壳，报 `cannot import name '__version__' from 'kopt'
+# (unknown location)`；换个目录跑又完全正常。
+#
+# 走法：Python 侧用**非 editable** 安装（pip install .），示例用
+# `--root examples/demo`；宿主插件 `kopt-dsh` 则显式设 PYTHONPATH=<仓库根>。
+
+[project]
+name = "kopt"
+version = "0.1.0"
+description = "Operator-optimization harness core: program steers, LLM sails, evidence adjudicates."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    # 3.11 起 tomllib 在标准库里，3.10 及更早要显式装（spec.py 里做了回退）。
+    'tomli>=2.0; python_version < "3.11"',
+]
+
+[project.scripts]
+kopt = "kopt.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["kopt*"]

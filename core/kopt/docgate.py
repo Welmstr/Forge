@@ -1,0 +1,216 @@
+"""散文校验 —— doc-gate。
+
+设计 §7.4。这里只做程序能做的事：
+
+  * 文件在对的位置、名字对；
+  * front-matter 存在且与收据逐字一致（模型不许改机器写的字段）；
+  * 正文里出现的每一个数，都能在收据里找到出处；
+  * 结构齐全（我们检查「有没有写」，不检查「写得好不好」）。
+
+「写得好不好」是人的判断，不是程序能判的。所以本模块**不**给文风打分，
+只保证：这篇东西里的数字不是编的。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+# 正文必须包含的段（设计 §7.3）
+REQUIRED_SECTIONS = (
+    "观察",
+    "假设",
+    "做了什么",
+    "结果",
+    "反证",
+    "学到了什么",
+    "适用边界",
+    "下一步",
+)
+
+# front-matter 里必须与收据一致的字段
+FROZEN_FIELDS = (
+    "run_id", "verdict", "speedup", "speedup_ci95", "accept_threshold",
+    "pairs_used", "pairs_reason", "noise_floor_sigma", "correctness",
+    "verify_receipt", "bench_receipt", "measurement_id", "source_sha256",
+    "spec_digest",
+)
+
+# 正文里出现这些还是会被放过：结构性的小数字（章节号、几个 case 之类）
+_BENIGN_INTS = {str(i) for i in range(0, 21)}
+
+# 论文和日常表述里的统计量：95% 置信区间、99% 分位……
+# 它们描述的是置信水平，不是测量结果。
+_PERCENT_RE = re.compile(r"\d+(?:\.\d+)?\s*%")
+
+# 在「量级陈述」之前补回被 _PERCENT_RE 吃掉的那半句说明。
+#
+# 另外一类被放行的数：
+#   "26 万个元素"、"两个数量级"、"一个纳秒" 这类措辞里的数不是测量结果，
+#   而是对量级和规模的陈述。程序判不了量级陈述对不对，
+#   但**测量值几乎不可能小于 1e-3**（时间以毫秒计、误差以 1e-6 计），
+#   所以放行这条不会变成放水的口子。
+_TINY_NUMBER = 0.001
+
+_NUMBER_RE = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?![\w.])")
+
+
+@dataclass
+class DocCheck:
+    path: Path
+    ok: bool
+    problems: list[str] = field(default_factory=list)
+    unverified_numbers: list[str] = field(default_factory=list)
+
+    def render(self) -> str:
+        if self.ok:
+            return f"DOC-GATE OK  {self.path.name}"
+        lines = [f"DOC-GATE FAILED  {self.path.name}"]
+        for p in self.problems:
+            lines.append(f"  - {p}")
+        if self.unverified_numbers:
+            lines.append("  unverified numbers: " + ", ".join(self.unverified_numbers))
+        return "\n".join(lines)
+
+
+def _num_key(v: Any) -> str:
+    """把数字归一化成可比较的字符串（容忍 3 位有效数字的取舍）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return f"{f:.6g}"
+
+
+def flatten_numbers(obj: Any, prefix: str = "") -> dict[str, str]:
+    """把收据里所有数字摊平成 {名字: 归一化值}。"""
+    out: dict[str, str] = {}
+
+    def walk(node: Any, path: str) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, f"{path}.{k}" if path else str(k))
+        elif isinstance(node, (list, tuple)):
+            for i, v in enumerate(node):
+                walk(v, f"{path}[{i}]")
+        elif isinstance(node, bool):
+            return
+        elif isinstance(node, (int, float)):
+            out[path] = _num_key(node)
+        elif isinstance(node, str):
+            for tok in _NUMBER_RE.findall(node):
+                out[f"{path}~text:{tok}"] = _num_key(tok)
+
+    walk(obj, prefix)
+    return out
+
+
+def check_prose(path: str | Path, *, front_matter: dict[str, Any],
+                allowed: dict[str, Any],
+                stage_numbers: dict[str, Any] | None = None,
+                required_sections: tuple[str, ...] = REQUIRED_SECTIONS
+                ) -> DocCheck:
+    p = Path(path)
+    problems: list[str] = []
+    unverified: list[str] = []
+
+    if not p.is_file():
+        return DocCheck(p, False, [f"file not found: {p}"])
+
+    text = p.read_text(encoding="utf-8")
+
+    # 散文正文从第一个标题开始；之前的 `---` 块是给程序看的元数据，
+    # 不参与数字校验（里面的数字来自 narrate，另行核对）。
+    body = text
+    if text.lstrip().startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            body = text[end + 4:]
+
+    # 反引号里的内容是「引用」而不是「断言」：
+    #   `bench.mean_ms`、`6ca9fb5c8441`、`1.77`
+    # 引用的东西可以来自别轮收据、可以来自接口名，读者看得到它的出处形态。
+    # 断言 —— 正文里裸着的数字 —— 才必须能在本轮收据里找到。
+    # 这条规则同时也是写散文的格式要求：凡是历史实测，加反引号。
+    quotable = body
+    body = re.sub(r"`[^`]*`", "「引用」", quotable)
+    # 百分比是置信水平之类的结构性表述，不是测量值
+    body = _PERCENT_RE.sub("「百分比」", body)
+
+    # ---- 1. front-matter：程序写的那一半必须原样存在 ----
+    # 它在 `docs/opt/<run_id>/front-matter.json`，而散文在 `docs/opt/<run_id>-<slug>.md`。
+    # 两者是**兄弟**，不是父子 —— 这一点写错过一次，别再写错。
+    fm_path = p.parent / p.name.split("-", 1)[0] / "front-matter.json"
+    if not fm_path.is_file():
+        # 兄弟目录找不到，再看整棵 docs/opt/ 树。
+        # 为什么需要这一步：REJECT / INDISTINGUISHABLE 的散文落在
+        # `docs/opt/rejected/r0004-<slug>.md`，而 front-matter 落在
+        # `docs/opt/r0004/front-matter.json` —— 不在同一层，「兄弟」规则够不着。
+        # 这里仍然只接受**这个名字**的目录，模型自己造一份 front-matter 是无效的：
+        # 下面的 written_by / 字段逐字比对会把它挡掉。
+        run_key = p.name.split("-", 1)[0]
+        for anc in p.parents:
+            if anc.name != "opt" and not str(anc).endswith(str(Path("docs") / "opt")):
+                continue
+            candidate = anc / run_key / "front-matter.json"
+            if candidate.is_file():
+                fm_path = candidate
+                break
+    if not fm_path.is_file():
+        problems.append(
+            f"missing {fm_path.parent.name}/front-matter.json — the machine half "
+            f"must be generated by `kopt narrate`, the model must not hand-write it"
+        )
+    else:
+        frozen = json.loads(fm_path.read_text(encoding="utf-8"))
+        # 同一目录下的多篇散文共用一份 front-matter，但只能属于同一个 run
+        if "run_id" in front_matter and frozen.get("run_id") != front_matter.get("run_id"):
+            problems.append(
+                f"front-matter.json run_id={frozen.get('run_id')!r} does not match "
+                f"the receipt ({front_matter.get('run_id')!r})"
+            )
+        for key in ("verdict", "measurement_id", "source_sha256", "bench_receipt"):
+            if key in front_matter and key in frozen and frozen[key] != front_matter[key]:
+                problems.append(
+                    f"front-matter.json {key} was edited: file has "
+                    f"{frozen[key]!r}, receipt has {front_matter[key]!r}"
+                )
+        if frozen.get("written_by") != "kopt":
+            problems.append("front-matter.json written_by is not 'kopt'")
+
+    # ---- 2. 结构：八个段落必须都在 ----
+    for sec in required_sections:
+        if sec not in text:
+            problems.append(f"missing required section: {sec}")
+
+    # ---- 3. 数字必须能在收据里找到 ----
+    known = {_num_key(v) for v in allowed.values()}
+    for key, val in flatten_numbers(front_matter).items():
+        known.add(val)
+    # 散文里引用的**任何**收据（比如某个中间轮的 verify）都算有出处；
+    # 但候选自己没测过的数字不算 —— 出处是指「harness 记过」，不是「模型记得」。
+    if stage_numbers:
+        for val in flatten_numbers(stage_numbers).values():
+            known.add(val)
+    for tok in _NUMBER_RE.findall(body):
+        norm = _num_key(tok)
+        if norm in _BENIGN_INTS:
+            continue
+        try:
+            if abs(float(tok)) < _TINY_NUMBER:
+                continue
+        except ValueError:
+            pass
+        if norm in known:
+            continue
+        unverified.append(tok)
+    if unverified:
+        problems.append(
+            f"{len(unverified)} number(s) in the prose cannot be traced to a "
+            f"receipt — see design §7.4: every figure must come from the harness"
+        )
+
+    return DocCheck(p, not problems, problems, unverified)

@@ -1,0 +1,26 @@
+# ---- 解释器与构建产物 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv*/
+venv/
+
+# ---- 演示项目跑出来的东西 ----
+# 收据、日志、知识库都是**跑出来的**，不是源码。
+# 把它们提交进去，会让"这份仓库能复现什么"变成一句空话 ——
+# 别人 clone 下来看到的是我的测量结果，不是他的。
+examples/*/receipts/
+examples/*/knowledge/
+examples/*/journal/
+examples/*/docs/
+examples/*/scratch/
+examples/*/env.lock.json
+examples/*/gate.json
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
