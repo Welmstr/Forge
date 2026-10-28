@@ -15,6 +15,7 @@
  * also mounts bash/pwsh would break the d4 guarantee — see README.
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import z from '@deepseek-ai/schemastery'
 import { appendFileSync, existsSync } from 'node:fs'
 import { isAbsolute, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -58,6 +59,33 @@ const DEFAULTS = {
   logRoot: '',
 }
 
+/**
+ * 配置形状。
+ *
+ * 宿主会拿这份声明去校验 `cordis.patch.yml` 里写的 `config`，所以字段名
+ * 写错、类型写错（比如 logRoot 写成 `~/.dsh` 这种字符串以外的类型）会
+ * **在启动时**报出来，而不是在第一次调用工具时才炸。没有这段声明，宿主
+ * 只会记一句"这是未知配置"，然后把错的东西原样交给我们。
+ *
+ * 注意：这是 Schemastery 形状（宿主用的就是它），不是 JSON Schema。
+ * 包名是 `@deepseek-ai/schemastery`，默认导出就是 `z`。
+ */
+export const Config = z.object({
+  pythonPath: z
+    .string()
+    .description('跑 kopt 的解释器。会被解析成真实路径（Windows 上补 .exe）。')
+    .default(DEFAULTS.pythonPath),
+  koptHome: z
+    .string()
+    .description('包含 kopt 包的那个目录（注意：是 kopt 的父目录，不是 kopt 本身）。')
+    .default(DEFAULTS.koptHome),
+  logRoot: z
+    .string()
+    .description('日志与注册证据写在哪。空 = 日志关闭。')
+    .default(DEFAULTS.logRoot),
+  sessionId: z.string().description('日志会话 id。留空则自动生成。').default(''),
+})
+
 const ENV = {
   // Force UTF-8 so Chinese prose survives the pipe on Windows.
   PYTHONIOENCODING: 'utf-8',
@@ -79,6 +107,9 @@ export const name = 'kopt-harness'
 export const inject = ['tools', 'subprocess', 'systemPrompt']
 
 export function apply(ctx, config = {}) {
+  // 优先级：配置文件 > 环境变量 > 内置默认值。
+  // 环境变量留着只是为了临时试错（换一个解释器），配置文件才是唯一记在
+  // 纸面上的真相——重启之后环境变量就没了，配置文件还在。
   const pythonPath = config.pythonPath || process.env.KOPT_PYTHON || DEFAULTS.pythonPath
   const koptHome = config.koptHome || process.env.KOPT_HOME || DEFAULTS.koptHome
   const logRoot = config.logRoot || process.env.KOPT_LOG_ROOT || DEFAULTS.logRoot
@@ -537,4 +568,10 @@ Exit codes are part of the protocol, not noise:
       traceRegistration(`PROMPT ok ${promptText.length}B`)
     }
   }
+
+  // 启动时把真正生效的配置记一行。下次"为什么工具跑不起来"，第一眼看这里，
+  // 而不是去猜环境变量有没有传进来。
+  traceRegistration(
+    `CONFIG pythonPath=${pythonPath} koptHome=${koptHome || '(空)'} logRoot=${logRoot || '(空)'} sessionId=${sessionId}`,
+  )
 }

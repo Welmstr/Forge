@@ -1,3 +1,14 @@
+# kopt-harness 的默认配置。**这里是唯一的真相**：重启之后环境变量会没，这个文件还在。
+#
+# 字段含义：
+#   pythonPath 跑 kopt 的解释器真实路径（Windows 上会补 .exe）
+#   koptHome   **包含** kopt 包的那个目录。本机布局里包在 <workspace>/kopt/kopt/，
+#              所以这里是 <workspace>/kopt —— 少了这一层会报 No module named kopt.cli
+#   logRoot    日志与注册证据写在哪；空字符串 = 日志关闭
 - insert:
     - id: kopt-harness
       name: '@local/kopt-harness'
+      config:
+        pythonPath: 'D:/新建文件夹/Python/python.exe'
+        koptHome: 'C:/Users/abczzz/Documents/deepseek-harness/default-workspace/kopt'
+        logRoot: 'C:/Users/abczzz/.dsh/forge-logs'
