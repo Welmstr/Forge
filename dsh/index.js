@@ -15,7 +15,38 @@
  * also mounts bash/pwsh would break the d4 guarantee — see README.
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { resolve } from 'node:path'
+import { appendFileSync, existsSync } from 'node:fs'
+import { isAbsolute, resolve } from 'node:path'
+
+/**
+ * 把「裸命令名」变成真实路径。
+ *
+ * 为什么不能直接把配置里的字符串交给 spawn：Windows 上如果有 `python`
+ * （比如 Store 版的别名或某个 .cmd 垫片），它解析出来的**不是**我们装
+ * `kopt` 的那个解释器。插件里能看到的一切，都是这个进程跑出来的——
+ * 所以要钉死在真实路径上，包括 `.exe` 后缀。
+ */
+function resolveExe(cmd, pythonPath, wslStyle) {
+  const bare = String(cmd).split(/[\\/]/).pop() ?? ''
+  const isPython = ['python', 'python3', pythonPath.split(/[\\/]/).pop()].includes(
+    bare.toLowerCase(),
+  )
+  if (!isPython) return cmd
+  const wantsExe = (p) => (wslStyle ? p : /\.exe$/i.test(p) ? p : `${p}.exe`)
+  const candidates = []
+  if (isAbsolute(pythonPath)) {
+    candidates.push(wantsExe(pythonPath))
+  } else {
+    for (const dir of (process.env.PATH ?? '').split(wslStyle ? ':' : ';')) {
+      if (!dir) continue
+      candidates.push(`${dir}${wslStyle ? '/' : '\\'}${wantsExe(pythonPath)}`)
+    }
+  }
+  for (const c of candidates) {
+    if (existsSync(c)) return c
+  }
+  return pythonPath
+}
 
 /** Python interpreter and CLI package root; overridable through Config. */
 const DEFAULTS = {
@@ -44,12 +75,19 @@ function tail(text, maxChars = 12000) {
 
 export const name = 'kopt-harness'
 
-export const inject = ['tools', 'subprocess']
+export const inject = ['tools', 'subprocess', 'systemPrompt']
 
 export function apply(ctx, config = {}) {
-  const pythonPath = config.pythonPath || DEFAULTS.pythonPath
-  const koptHome = config.koptHome || DEFAULTS.koptHome
-  const logRoot = config.logRoot || DEFAULTS.logRoot
+  const pythonPath = config.pythonPath || process.env.KOPT_PYTHON || DEFAULTS.pythonPath
+  const koptHome = config.koptHome || process.env.KOPT_HOME || DEFAULTS.koptHome
+  const logRoot = config.logRoot || process.env.KOPT_LOG_ROOT || DEFAULTS.logRoot
+  // 解释器路径里是 `/`（WSL 风格）还是 `\`（Windows 风格），决定怎么解析成真实路径。
+  const wslStyle = pythonPath.includes('/')
+  const launch = (args) => {
+    if (!args.length) return args
+    const exe = resolveExe(args[0], pythonPath, wslStyle)
+    return exe === args[0] ? args : [exe, ...args.slice(1)]
+  }
   if (!koptHome) {
     ctx.logger?.warn?.(
       'kopt-harness: koptHome is empty; set it in cordis.patch.yml to the directory that contains the kopt package.',
@@ -81,7 +119,7 @@ export function apply(ctx, config = {}) {
    */
   async function runKopt(args, exec) {
     const handle = ctx.subprocess.spawn({
-      argv: [pythonPath, '-m', 'kopt.cli', ...args],
+      argv: launch([pythonPath, '-m', 'kopt.cli', ...args]),
       cwd: koptHome || rootOf(exec),
       stdio: {
         stdin: 'ignore',
@@ -142,6 +180,40 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  /**
+   * 注册探针：把每一次 register 的名字写进一份证据文件。
+   *
+   * 存在的理由：「工具注册好了没有」不能靠界面看着像、也不能靠模型嘴上说，
+   * 必须由程序在**真实运行的那一份代码**里留下痕迹。这个文件由 harness 写、
+   * 人和 agent 都改不了，是"程序掌舵"用在自校验上的那一面。
+   */
+  function traceRegistration(toolName) {
+    try {
+      // 用绝对路径、直接写在已知位置：进程 cwd 未知，相对路径会落到意想不到的地方
+      appendFileSync(
+        'C:\\Users\\abczzz\\.dsh\\forge-logs\\_register-evidence.log',
+        `${new Date().toISOString()} pid=${process.pid} cwd=${process.cwd()} register=${toolName}\n`,
+      )
+    } catch {
+      /* 证据写不进去不能拖垮注册本身 */
+    }
+  }
+
+  function registerTool(definition) {
+    traceRegistration(definition.name)
+    try {
+      const handle = ctx.tools.register(defineTool(definition))
+      // 取证线索：register 返回的东西决定宿主后面拿什么去拼工具表。
+      // 如果它返回 undefined，说明"注册成功"只是我以为的。
+      traceRegistration(`RETURN ${definition.name} ${typeof handle} ${handle === undefined ? 'UNDEFINED' : ''}`)
+      return handle
+    } catch (err) {
+      traceRegistration(`ERROR ${definition.name} ${err?.message ?? err}`)
+      ctx.logger?.warn?.(`kopt-harness: register ${definition.name} failed: ${err?.message ?? err}`)
+      return undefined
+    }
+  }
+
   /** 包一层：任何工具调用都会留下一条 calls.jsonl，包括失败的那次。 */
   function logged(toolName, body) {
     return async (args, exec) => {
@@ -186,8 +258,7 @@ Exit codes are part of the protocol, not noise:
   //   - 参数由 CLI 拼死，agent 传不进来任何东西；
   //   - 调不调用由 agent 自己决定 —— 它不是流程的一步，是它判断时的证据来源。
   // 「看一眼」不会削弱判决的可信度：读不出加速比。
-  ctx.tools.register(
-    defineTool({
+  registerTool({
       name: 'kopt_inspect',
       description:
         'Read-only. Disassemble a compiled artifact (.so/.o/.a/.elf) so you can check what the compiler actually emitted — vectorisation, unrolling, spills, whether the march flag took effect. This never compiles, never runs, never times anything. Call it when you need evidence about codegen, not as a workflow step.',
@@ -209,12 +280,10 @@ Exit codes are part of the protocol, not noise:
         const r = await runKopt(argv, exec)
         return render(r)
       }),
-    }),
-  )
+  })
 
   // ---------------------------------------------------------------- S0/S1
-  ctx.tools.register(
-    defineTool({
+  registerTool({
       name: 'kopt_probe',
       description:
         'Stage S0/S1. Probe hardware and software, write a report to docs/recon/, and leave the human gate pending. Run this first, then STOP and let the human read the report.',
@@ -224,11 +293,9 @@ Exit codes are part of the protocol, not noise:
         const r = await runKopt(['--root', rootOf(exec), 'probe'], exec)
         return render(r)
       }),
-    }),
-  )
+  })
 
-  ctx.tools.register(
-    defineTool({
+  registerTool({
       name: 'kopt_probe_status',
       description: 'Show the human gate state and the frozen environment digest.',
       parameters: {},
@@ -237,12 +304,10 @@ Exit codes are part of the protocol, not noise:
         const r = await runKopt(['--root', rootOf(exec), 'probe-status'], exec)
         return render(r)
       }),
-    }),
-  )
+  })
 
   // --------------------------------------------------------- S3 calibration
-  ctx.tools.register(
-    defineTool({
+  registerTool({
       name: 'kopt_calibrate',
       description:
         'Stage S3. A/A calibration: run the reference against itself in interleaved pairs to estimate the noise floor (sigma). Every performance verdict depends on this; run it after the gate is approved and again whenever the environment changes.',
@@ -261,14 +326,12 @@ Exit codes are part of the protocol, not noise:
         const r = await runKopt(argv, exec)
         return render(r)
       }),
-    }),
-  )
+  })
 
   // ------------------------------------------------------ S8 verify + S9 bench
   //
   // One tool, on purpose. See the module comment.
-  ctx.tools.register(
-    defineTool({
+  registerTool({
       name: 'kopt_verify',
       description:
         'Stage S8 (and, only if S8 passes, S9). Verify a candidate against the reference with the mutation sentinel, then time it with interleaved ABBA pairs. Returns PASS/FAIL and the measured speedup. Pass candidate "__baseline__" to verify the reference against itself.',
@@ -315,12 +378,10 @@ Exit codes are part of the protocol, not noise:
         const text = [v.stdout.trim(), '', b.stdout.trim(), b.stderr.trim()].filter(Boolean).join('\n')
         return [{ type: 'text', text: tail(text) }]
       }),
-    }),
-  )
+  })
 
   // ---------------------------------------------------------- S10 adjudicate
-  ctx.tools.register(
-    defineTool({
+  registerTool({
       name: 'kopt_adjudicate',
       description:
         'Stage S10. Turn the most recent bench into a verdict: ACCEPT / REJECT / INDISTINGUISHABLE / SUSPECT / INVALID. The verdict is computed from the receipts, not chosen. Do not argue with it.',
@@ -330,12 +391,10 @@ Exit codes are part of the protocol, not noise:
         const r = await runKopt(['--root', rootOf(exec), 'adjudicate'], exec)
         return render(r)
       }),
-    }),
-  )
+  })
 
   // ------------------------------------------------------------- S11 prose
-  ctx.tools.register(
-    defineTool({
+  registerTool({
       name: 'kopt_narrate',
       description:
         'Stage S11a. Emit the machine-written half of the write-up: docs/opt/<run_id>/front-matter.json plus the exact list of numbers the prose may contain. Call before writing prose; never hand-write these fields.',
@@ -351,11 +410,9 @@ Exit codes are part of the protocol, not noise:
         const r = await runKopt(argv, exec)
         return render(r)
       }),
-    }),
-  )
+  })
 
-  ctx.tools.register(
-    defineTool({
+  registerTool({
       name: 'kopt_doc_gate',
       description:
         'Stage S11b. Validate the prose written for a run: structure, frozen front-matter, and that every bare number traces to a receipt. Write to docs/opt/ for ACCEPT and docs/opt/rejected/ for the others.',
@@ -371,12 +428,10 @@ Exit codes are part of the protocol, not noise:
         const r = await runKopt(argv, exec)
         return render(r)
       }),
-    }),
-  )
+  })
 
   // --------------------------------------------------------------- budget
-  ctx.tools.register(
-    defineTool({
+  registerTool({
       name: 'kopt_pending',
       description:
         'List verdicts whose prose is still owed. Writing them is a closure condition, not a courtesy — `kopt_propose` refuses while any remain.',
@@ -386,11 +441,9 @@ Exit codes are part of the protocol, not noise:
         const r = await runKopt(['--root', rootOf(exec), 'pending'], exec)
         return render(r)
       }),
-    }),
-  )
+  })
 
-  ctx.tools.register(
-    defineTool({
+  registerTool({
       name: 'kopt_propose',
       description:
         'Stage S6. Ask to start the next optimization round. Refused with exit 2 while previous results are not archived. If allowed, you may then edit work/candidate/ only.',
@@ -400,12 +453,10 @@ Exit codes are part of the protocol, not noise:
         const r = await runKopt(['--root', rootOf(exec), 'propose'], exec)
         return render(r)
       }),
-    }),
-  )
+  })
 
   // ----------------------------------------------------------- write policy
-  ctx.tools.register(
-    defineTool({
+  registerTool({
       name: 'kopt_guard',
       description:
         'Check whether paths are writable by you. Protected: spec.toml, reference/, receipts/, harness/. Writable: work/candidate/, scratch/. Append-only: docs/, journal/, knowledge/. Refuses with exit 6 if anything is protected.',
@@ -422,36 +473,60 @@ Exit codes are part of the protocol, not noise:
         const r = await runKopt(['--root', rootOf(exec), 'guard', ...args.paths], exec)
         return render(r)
       }),
-    }),
-  )
+  })
 
   // ------------------------------------------------------- system prompt
   //
   // The harness's rules belong in the prompt too, but as *pointers to the
   // program* — never as a second copy of the rules that could drift.
+  //
+  // 教训（2026-10 实测，四条腿的消融实验）：
+  //   1. 这一段原本写的是 `content: [...]`。宿主 `systemPrompt.section()`
+  //      只认 `{ name, order, text }`，`content` 会被忽略，`text` 于是是
+  //      undefined。
+  //   2. 紧接着 `renderPrompt` 对每段做 `text.indexOf("{{")`，于是整轮会话
+  //      死在 `Cannot read properties of undefined (reading 'indexOf')`——
+  //      而且发生在 step/start 之后、request/header 之前，所以模型永远收
+  //      不到工具表，看起来就像"插件没注册上"。
+  //   3. 脚本里那段 `content: [...].join('\n')` 并没有被替换掉，所以即使
+  //      把 content 换成 text，只要不显式写 `interpolate: false`，宿主还会
+  //      在文本里找 `{{变量}}`，踩到同一个坑。
+  // 现在：文本是纯字符串、显式 interpolate:false（内容里没有任何变量）、
+  // 并且加了类型检查——写错就自己报出来，绝不再让宿主悄悄崩在 indexOf。
   if (ctx.systemPrompt?.section) {
-    ctx.systemPrompt.section({
-      name: 'kopt-harness',
-      content: [
-        'This workspace uses the kopt optimization harness. The program steers;',
-        'you sail. You decide what to try. You never decide what counts as correct',
-        'or as faster.',
-        '',
-        'Workflow: kopt_probe -> (human approves) -> kopt_calibrate -> write a',
-        'candidate in work/candidate/ -> kopt_verify -> kopt_adjudicate ->',
-        'kopt_narrate -> write the prose -> kopt_doc_gate -> kopt_propose.',
-        '',
-        'Rules you cannot bend:',
-        '- Never edit spec.toml, reference/, receipts/, or the harness. If a test',
-        '  seems wrong, say so; do not weaken it.',
-        '- Do not run your own timing. kopt_verify is the only timing source; a',
-        '  speedup you measured yourself is not evidence.',
-        '- Every verdict needs prose, including REJECT and INDISTINGUISHABLE.',
-        '  "We tried this and could not tell" is knowledge.',
-        '- Numbers in prose must come from receipts. Quote anything else with',
-        '  backticks and say where it came from.',
-        EXIT_MEANING,
-      ].join('\n'),
-    })
+    const promptText = [
+      'This workspace uses the kopt optimization harness. The program steers;',
+      'you sail. You decide what to try. You never decide what counts as correct',
+      'or as faster.',
+      '',
+      'Workflow: kopt_probe -> (human approves) -> kopt_calibrate -> write a',
+      'candidate in work/candidate/ -> kopt_verify -> kopt_adjudicate ->',
+      'kopt_narrate -> write the prose -> kopt_doc_gate -> kopt_propose.',
+      '',
+      'Rules you cannot bend:',
+      '- Never edit spec.toml, reference/, receipts/, or the harness. If a test',
+      '  seems wrong, say so; do not weaken it.',
+      '- Do not run your own timing. kopt_verify is the only timing source; a',
+      '  speedup you measured yourself is not evidence.',
+      '- Every verdict needs prose, including REJECT and INDISTINGUISHABLE.',
+      '  "We tried this and could not tell" is knowledge.',
+      '- Numbers in prose must come from receipts. Quote anything else with',
+      '  backticks and say where it came from.',
+      EXIT_MEANING,
+    ].join('\n')
+    if (typeof promptText !== 'string' || promptText.length === 0) {
+      traceRegistration('ERROR promptSection text is not a non-empty string')
+    } else {
+      ctx.systemPrompt.section({
+        name: 'kopt-harness',
+        // order 是必填的有限数：位置由它决定，缺了 DSH 直接拒绝注册。
+        order: 50,
+        // 字段名必须是 text。content 是空想出来的名字，宿主不认。
+        text: promptText,
+        // 这段是死文本，没有 {{变量}}。显式关掉插值，避免宿主再去解析。
+        interpolate: false,
+      })
+      traceRegistration(`PROMPT ok ${promptText.length}B`)
+    }
   }
 }
