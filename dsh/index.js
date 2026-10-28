@@ -17,6 +17,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { appendFileSync, existsSync } from 'node:fs'
 import { isAbsolute, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
 
 /**
  * 把「裸命令名」变成真实路径。
@@ -186,12 +187,17 @@ export function apply(ctx, config = {}) {
    * 存在的理由：「工具注册好了没有」不能靠界面看着像、也不能靠模型嘴上说，
    * 必须由程序在**真实运行的那一份代码**里留下痕迹。这个文件由 harness 写、
    * 人和 agent 都改不了，是"程序掌舵"用在自校验上的那一面。
+   *
+   * 默认落在 <logRoot>/_register-evidence.log。logRoot 为空时（用户就是想
+   * 关日志）退回临时目录，绝不写死某个人的家目录。
    */
   function traceRegistration(toolName) {
     try {
-      // 用绝对路径、直接写在已知位置：进程 cwd 未知，相对路径会落到意想不到的地方
+      const target = logRoot
+        ? resolve(logRoot, '_register-evidence.log')
+        : resolve(tmpdir(), 'kopt-register-evidence.log')
       appendFileSync(
-        'C:\\Users\\abczzz\\.dsh\\forge-logs\\_register-evidence.log',
+        target,
         `${new Date().toISOString()} pid=${process.pid} cwd=${process.cwd()} register=${toolName}\n`,
       )
     } catch {
@@ -203,9 +209,11 @@ export function apply(ctx, config = {}) {
     traceRegistration(definition.name)
     try {
       const handle = ctx.tools.register(defineTool(definition))
-      // 取证线索：register 返回的东西决定宿主后面拿什么去拼工具表。
-      // 如果它返回 undefined，说明"注册成功"只是我以为的。
-      traceRegistration(`RETURN ${definition.name} ${typeof handle} ${handle === undefined ? 'UNDEFINED' : ''}`)
+      // register 返回的是注销函数本身。如果它变成 undefined，说明"注册
+      // 成功"只是我以为的——所以把类型也记下来，出问题时有据可查。
+      if (typeof handle !== 'function') {
+        traceRegistration(`WARN ${definition.name} register returned ${typeof handle}`)
+      }
       return handle
     } catch (err) {
       traceRegistration(`ERROR ${definition.name} ${err?.message ?? err}`)
